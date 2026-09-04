@@ -9,7 +9,7 @@ Zero runtime dependencies. Python 3.10+.
 ## Install
 
 ```bash
-pip install git+https://github.com/maqarios/dumper7-pyparser
+pip install git+https://github.com/Maqarios/dumper7-pyparser
 # or, from a checkout:
 pip install .
 ```
