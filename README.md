@@ -85,6 +85,48 @@ where `<Engine>` and `<Location>` come from that repo's `Games/GameList.json` (e
 - `TArray`, `TMap`, `TSubclassOf` and other templates have no definition in the dump, so
   `dump.type_of()` returns `None` for them; inspect `TypeRef.sub_types` instead.
 
+### Pointer chains
+
+`dumper7_pyparser.chains` is an opt-in query layer that answers "how do I reach this member in
+memory" using only the dump. It never reads memory: a chain is data plus a rendered string, and you
+walk it with your own reader.
+
+```python
+from dumper7_pyparser.chains import chain, find_paths
+
+c = chain(dump, "GWorld.PersistentLevel.Actors[0]")   # values below are from a real Mordhau dump
+c.offsets            # [0x59200F8, 0x30, 0x98, 0x0]   module-relative, Cheat-Engine style
+c.base               # 'module'  ('object' when rooted at a class, e.g. "UWorld.PersistentLevel")
+c.result_type        # TypeRef('AActor*')
+print(c.render())
+# GWorld.PersistentLevel.Actors[0]
+#   [module base]
+#   +0x59200F8 GWorld : UWorld*  -> deref
+#   +0x30     PersistentLevel : ULevel*  -> deref
+#   +0x98     Actors : TArray<AActor*>  -> read Data pointer
+#   +0x0      [0] : AActor*  (index 0 x 8)  -> deref
+#   offsets: [0x59200F8, 0x30, 0x98, 0x0]
+
+for route in find_paths(dump, "GWorld", "APlayerController"):
+    print(route)     # e.g. GWorld.OwningGameInstance.LocalPlayers[0].PlayerController: 0x59200F8 -> 0x180 -> 0x38 -> 0x0 -> 0x30  (APlayerController*)
+```
+
+Offsets contract: `addr = base; for off in offsets[:-1]: addr = read_pointer(addr + off); result = addr + offsets[-1]`.
+`base` is the game module's image base for `module` chains and an instance address for `object`
+chains. The result is the address *of* the final member; if `result_is_pointer` read it once more.
+Embedded structs are folded into a single offset.
+
+- Roots: a class/struct, `Owner::Member`, or an `OffsetsInfo.json` global (`GWorld`, `GObjects`,
+  `GNames`, or any raw `OFFSET_*` key). Only `GWorld` is a pointer the chain can descend through.
+- Index steps: fixed C arrays and `TArray` (data pointer at +0, stride from the dump or a small
+  primitive table; `pointer_size=` defaults to 8). `TMap`, `TSet` and smart pointers raise `ChainError`.
+- `find_paths(dump, src, dst, max_depth=3, include_subclasses=True, limit=50)` does a breadth-first
+  search over member types and returns runnable chains, using `[0]` for array elements.
+
+```bash
+python -m dumper7_pyparser path/to/Dumpspace --chain "GWorld.Levels[0].Actors" --paths GWorld APlayerController
+```
+
 ### Names that are not valid attributes
 
 Dumper-7 emits `Package::Name` when a name is not unique (e.g. `Engine::FHitResult`).

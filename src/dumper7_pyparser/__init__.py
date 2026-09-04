@@ -8,6 +8,8 @@
     dump.enums.EFoo.Bar                          # int
     dump.functions.UWorld.GetName.signature      # str
     dump.offsets.OFFSET_GWORLD                   # int
+
+Pointer-chain queries (opt-in, no memory access) live in ``dumper7_pyparser.chains``.
 """
 
 from ._io import FILE_NAMES

@@ -43,6 +43,13 @@ class TypeRef:
     sub_types: tuple["TypeRef", ...] = field(default_factory=tuple)
     is_reference: bool = False
 
+    def __post_init__(self) -> None:
+        # Accept the bare letter ("C") so hand-built refs compare like parsed ones.
+        if not isinstance(self.kind, TypeKind):
+            object.__setattr__(self, "kind", TypeKind.from_letter(self.kind))
+        if not isinstance(self.sub_types, tuple):
+            object.__setattr__(self, "sub_types", tuple(self.sub_types))
+
     @property
     def is_pointer(self) -> bool:
         return "*" in self.extended

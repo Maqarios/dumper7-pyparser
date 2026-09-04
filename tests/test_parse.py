@@ -23,6 +23,13 @@ def test_typeref_reference_and_short_arrays():
     assert TypeRef.from_raw(["int32"]).kind is TypeKind.DEFAULT
 
 
+def test_typeref_accepts_bare_kind_letter():
+    assert TypeRef("AActor", "C", "*") == TypeRef("AActor", TypeKind.CLASS, "*")
+    assert TypeRef("X", "S", "", [TypeRef("int32")]).sub_types == (TypeRef("int32"),)
+    with pytest.raises(DumpFormatError):
+        TypeRef("X", "Q")
+
+
 def test_typeref_errors():
     with pytest.raises(DumpFormatError):
         TypeRef.from_raw("int")
