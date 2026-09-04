@@ -1,0 +1,18 @@
+{"updated_at":"1725400000000","data":[
+{"FVector":[{"__InheritInfo":[]},{"__MDKClassSize":12},
+ {"X":[["float","D","",[]],0,4,1]},
+ {"Y":[["float","D","",[]],4,4,1]},
+ {"Z":[["float","D","",[]],8,4,1]}]},
+{"FTickFunction":[{"__InheritInfo":[]},{"__MDKClassSize":48},
+ {"TickGroup":[["ETickingGroup","E","",[]],8,1,1]},
+ {"bTickEvenWhenPaused":[["bool","D","",[]],10,1,1,0]},
+ {"bCanEverTick":[["bool","D","",[]],10,1,1,1]},
+ {"TickInterval":[["float","D","",[]],12,4,1]}]},
+{"FActorTickFunction":[{"__InheritInfo":["FTickFunction"]},{"__MDKClassSize":48}]},
+{"Engine::FHitResult":[{"__InheritInfo":[]},{"__MDKClassSize":136},
+ {"bBlockingHit":[["bool","D","",[]],0,1,1,0]},
+ {"Location":[["FVector","S","",[]],16,12,1]},
+ {"Actor":[["TWeakObjectPtr","C","",[["AActor","C","*",[]]]],104,8,1]}]},
+{"Other::FHitResult":[{"__InheritInfo":[]},{"__MDKClassSize":8},
+ {"Dummy":[["int32","D","",[]],0,4,1]}]}
+],"version":10202}

@@ -1,0 +1,5 @@
+{"updated_at":"1725400000000","data":[
+{"EWorldType":[[{"None":0},{"Game":1},{"Editor":2},{"PIE":3},{"EditorPreview":4},{"GamePreview":5},{"GameRPC":6},{"Inactive":7},{"EWorldType_MAX":8}],"uint8"]},
+{"ETickingGroup":[[{"TG_PrePhysics":0},{"TG_StartPhysics":1},{"TG_DuringPhysics":2},{"TG_MAX":3}],"uint8"]},
+{"EBig":[[{"A":0},{"B":65536},{"EBig_MAX":65537}],"uint32"]}
+],"version":10202}

@@ -1,0 +1,8 @@
+{"updated_at":"1725400000000","data":[
+{"AActor":[
+ {"K2_SetActorLocation":[["bool","D","",[]],[[["FVector","S","",[]],"&","NewLocation"],[["bool","D","",[]],"","bSweep"],[["Engine::FHitResult","S","",[]],"&","SweepHitResult"],[["bool","D","",[]],"","bTeleport"]],123456,"Final|Native|Public|BlueprintCallable"]},
+ {"K2_DestroyActor":[["void","D","",[]],[],123500,"Final|Native|Public|BlueprintCallable"]}]},
+{"UWorld":[
+ {"GetGameState":[["AGameStateBase","C","*",[]],[],200000,"Native|Public|Const"]},
+ {"GetLevels":[["TArray","C","",[["ULevel","C","*",[]]]],[],200100,"Native|Public|Const"]}]}
+],"version":10202}
