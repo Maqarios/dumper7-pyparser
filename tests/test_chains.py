@@ -5,7 +5,7 @@ import pytest
 from dumper7_pyparser import Dump, load_dump
 from dumper7_pyparser.__main__ import main
 from dumper7_pyparser.chains import Chain, ChainError, chain, element_size, find_paths, parse_path
-from dumper7_pyparser.types import TypeRef
+from dumper7_pyparser.types import TypeKind, TypeRef
 
 GWORLD = 1011  # fixture OFFSET_GWORLD
 
@@ -101,8 +101,36 @@ def test_element_size(dump: Dump):
     assert element_size(dump, TypeRef("FVector", "S")) == 12
     assert element_size(dump, TypeRef("int32")) == 4
     assert element_size(dump, TypeRef("FString")) == 16
+    assert element_size(dump, TypeRef("EBig", "E")) == 4            # the enum's underlying type
+    assert element_size(dump, TypeRef("EWorldType", "E")) == 1
+
+
+def test_element_size_of_undefined_types_comes_from_the_dump_s_members(dump: Dump):
+    assert dump.observed_size("FName") == 8                         # UObject.Name
+    assert element_size(dump, TypeRef("FName", "S")) == 8
+    assert element_size(dump, TypeRef("TWeakObjectPtr", "D", "", [TypeRef("AActor", "C", "*")])) == 8
+    assert element_size(dump, TypeRef("TSubclassOf", "C", "", [TypeRef("UObject", "C", "*")])) == 8
+    c = chain(dump, "AActor.Tags[2]")
+    assert c.offsets == [0x198, 0x10] and str(c.result_type) == "FName"
+    assert dump.observed_size("FNoSuchType") is None
     with pytest.raises(ChainError, match="unknown element size"):
-        element_size(dump, TypeRef("FName", "S"))
+        element_size(dump, TypeRef("FNoSuchType", "S"))
+
+
+def test_observed_size_refuses_types_whose_members_disagree():
+    from dumper7_pyparser.models import Member, Struct
+    from dumper7_pyparser._namespace import Namespace
+
+    def struct(name: str, size: int) -> Struct:
+        member = Member("Value", name, TypeRef("FOdd"), 0, size)
+        return Struct(name, TypeKind.STRUCT, size, (), Namespace({"Value": member}, label=name))
+
+    agreeing = Dump(structs=Namespace({"FA": struct("FA", 8), "FB": struct("FB", 8)}, label="structs"))
+    assert agreeing.observed_size("FOdd") == 8
+    mixed = Dump(structs=Namespace({"FA": struct("FA", 8), "FB": struct("FB", 12)}, label="structs"))
+    assert mixed.observed_size("FOdd") is None
+    with pytest.raises(ChainError, match="unknown element size"):
+        element_size(mixed, TypeRef("FOdd"))
 
 
 # -- global roots ----------------------------------------------------------------------

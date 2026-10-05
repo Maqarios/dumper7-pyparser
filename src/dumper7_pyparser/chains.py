@@ -45,8 +45,9 @@ class ChainError(LookupError):
 
 
 # Sizes of primitives the dump names but never defines. Anything else must come
-# from the dump (struct sizes) or be a pointer. FName is deliberately absent: its
-# size differs between engine builds (8 or 12 bytes).
+# from the dump (struct sizes, enum underlying types, the size its members give a
+# type) or be a pointer. FName is deliberately absent: its size differs between
+# engine builds (8 or 12 bytes), so it is taken from the dump's own FName members.
 PRIMITIVE_SIZES: dict[str, int] = {
     "bool": 1, "char": 1, "int8": 1, "uint8": 1,
     "int16": 2, "uint16": 2,
@@ -164,7 +165,13 @@ def parse_path(path: str) -> list[tuple[str, int | None]]:
 
 
 def element_size(dump: "Dump", ref: TypeRef, pointer_size: int = 8) -> int:
-    """Byte size of one ``ref`` value, for array strides."""
+    """Byte size of one ``ref`` value, for array strides.
+
+    Pointers, structs the dump defines, primitives and enums (their underlying type)
+    are exact. Any other type (``FName``, ``FText``, ``TSubclassOf<...>``, ...) takes
+    the size the dump's own members of that type agree on, see
+    :meth:`Dump.observed_size`.
+    """
     if ref.is_pointer:
         return pointer_size
     if ref.kind in (TypeKind.CLASS, TypeKind.STRUCT):
@@ -173,6 +180,13 @@ def element_size(dump: "Dump", ref: TypeRef, pointer_size: int = 8) -> int:
             return defined.size
     if ref.name in PRIMITIVE_SIZES and not ref.sub_types:
         return PRIMITIVE_SIZES[ref.name]
+    if ref.kind is TypeKind.ENUM:
+        enum = dump.enums.get(ref.name)
+        if enum is not None and enum.underlying_type in PRIMITIVE_SIZES:
+            return PRIMITIVE_SIZES[enum.underlying_type]
+    observed = dump.observed_size(ref.name)
+    if observed:
+        return observed
     raise ChainError(f"unknown element size for {ref}")
 
 

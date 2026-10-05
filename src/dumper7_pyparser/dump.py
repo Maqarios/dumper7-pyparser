@@ -23,7 +23,7 @@ class Dump:
     ``dump.offsets.OFFSET_GWORLD``          -> ``int``
     """
 
-    __slots__ = ("classes", "structs", "enums", "functions", "offsets", "info", "source")
+    __slots__ = ("classes", "structs", "enums", "functions", "offsets", "info", "source", "_observed_sizes")
 
     def __init__(
         self,
@@ -48,6 +48,7 @@ class Dump:
         self._link()
 
     def _link(self) -> None:
+        self._observed_sizes: dict[str, int | None] | None = None
         for ns in (self.classes, self.structs):
             for struct in ns.values():
                 struct._dump = self
@@ -126,6 +127,28 @@ class Dump:
         if ref.kind is TypeKind.ENUM:
             return self.enums.get(ref.name)
         return None
+
+    def observed_size(self, name: str) -> int | None:
+        """Byte size the dump's members give the type ``name``, or ``None``.
+
+        For types the dump names but never defines (``FName``, ``FText``,
+        ``TSubclassOf``, ``TWeakObjectPtr``, ...): the size shared by every plain
+        member of that type (no pointers, bitfields or fixed arrays). ``None`` when no
+        such member exists or they disagree.
+        """
+        sizes = self._observed_sizes
+        if sizes is None:
+            sizes = {}
+            for ns in (self.classes, self.structs):
+                for struct in ns.values():
+                    for member in struct.own_members.values():
+                        ref = member.type
+                        if ref.is_pointer or member.bit_offset is not None or member.array_dim != 1:
+                            continue
+                        if sizes.setdefault(ref.name, member.size) != member.size:
+                            sizes[ref.name] = None
+            self._observed_sizes = sizes
+        return sizes.get(name)
 
     def resolve(self, query: str) -> Member | Function:
         """Resolve ``"Owner::Name"`` to a member (via inheritance) or function."""
