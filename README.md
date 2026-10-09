@@ -120,6 +120,11 @@ Embedded structs are folded into a single offset.
   `GNames`, or any raw `OFFSET_*` key). Only `GWorld` is a pointer the chain can descend through.
 - Index steps: fixed C arrays and `TArray` (data pointer at +0, stride from the dump or a small
   primitive table; `pointer_size=` defaults to 8). `TMap`, `TSet` and smart pointers raise `ChainError`.
+- Casts: `Actors[0](APawn).Controller` or `Controller(APlayerController).PlayerCameraManager` re-type
+  an object pointer as a subclass defined in the dump (the declared class itself, or one deriving
+  from it), so the walk can continue into members the declared type lacks. The hop keeps its offset
+  and gets `cast` set; the dump cannot know what the object really is, so the caller must. Roots and
+  non-pointers cannot be cast.
 - `find_paths(dump, src, dst, max_depth=3, include_subclasses=True, limit=50)` does a breadth-first
   search over member types and returns runnable chains, using `[0]` for array elements.
 

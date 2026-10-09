@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import re
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from .models import Member, Struct
@@ -71,7 +71,8 @@ GLOBAL_TYPES: dict[str, TypeRef] = {
     "OFFSET_GNAMES": TypeRef("FNamePool", TypeKind.STRUCT),
 }
 
-_TOKEN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)(?:\[(\d+)\])?$")
+_NAME = r"[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*"
+_TOKEN_RE = re.compile(rf"^({_NAME})(?:\[(\d+)\])?(?:\(({_NAME})\))?$")
 
 
 # -- data ----------------------------------------------------------------------------
@@ -89,6 +90,7 @@ class Hop:
     index: int | None = None
     stride: int | None = None
     note: str = ""
+    cast: Struct | None = None      # the pointer was re-typed to this subclass (``type`` already says so)
 
     def describe(self) -> str:
         text = f"+0x{self.offset:X}".ljust(8) + f" {self.label} : {self.type}"
@@ -147,18 +149,20 @@ class Chain:
 # -- parsing ---------------------------------------------------------------------------
 
 
-def parse_path(path: str) -> list[tuple[str, int | None]]:
-    """Split ``"A.B[3].C"`` into ``[("A", None), ("B", 3), ("C", None)]``.
+def parse_path(path: str) -> list[tuple[str, int | None, str | None]]:
+    """Split ``"A.B[3](D).C"`` into ``[("A", None, None), ("B", 3, "D"), ("C", None, None)]``:
+    one ``(name, index, cast)`` per element.
 
-    Names may contain ``::`` (package prefixes, or the ``Owner::Member`` form).
+    Names may contain ``::`` (package prefixes, or the ``Owner::Member`` form). ``(D)``
+    re-types the pointer the element holds as its subclass ``D`` (see :func:`chain`).
     """
     pieces = path.strip().split(".")
-    tokens: list[tuple[str, int | None]] = []
+    tokens: list[tuple[str, int | None, str | None]] = []
     for piece in pieces:
         m = _TOKEN_RE.match(piece)
         if not m:
-            raise ChainError(f"bad path element {piece!r} in {path!r} (expected Name or Name[index])")
-        tokens.append((m.group(1), int(m.group(2)) if m.group(2) is not None else None))
+            raise ChainError(f"bad path element {piece!r} in {path!r} (expected Name, Name[index] or Name(Cast))")
+        tokens.append((m.group(1), int(m.group(2)) if m.group(2) is not None else None, m.group(3)))
     if not tokens:
         raise ChainError("empty path")
     return tokens
@@ -206,9 +210,11 @@ def _struct_for(dump: "Dump", ref: TypeRef) -> Struct | None:
     return found if isinstance(found, Struct) else None
 
 
-def _resolve_root(dump: "Dump", tokens: list[tuple[str, int | None]]) -> tuple[str, str, Hop | None, Struct | None, TypeRef | None, list]:
+def _resolve_root(dump: "Dump", tokens: list[tuple[str, int | None, str | None]]) -> tuple[str, str, Hop | None, Struct | None, TypeRef | None, list]:
     """Return ``(base, root_name, root_hop, cursor_struct, cursor_type, remaining_tokens)``."""
-    name, index = tokens[0]
+    name, index, cast = tokens[0]
+    if cast is not None:
+        raise ChainError(f"root {name} cannot be cast: name the class you want as the root instead")
     key = _global_key(name)
     if key is not None:
         if index is not None:
@@ -230,7 +236,7 @@ def _resolve_root(dump: "Dump", tokens: list[tuple[str, int | None]]) -> tuple[s
     if sep:
         struct = dump.find_struct(owner)
         if struct is not None:
-            return "object", struct.name, None, struct, None, [(member, index)] + tokens[1:]
+            return "object", struct.name, None, struct, None, [(member, index, None)] + tokens[1:]
 
     raise ChainError(f"unknown root {name!r}: not a class, struct, or OffsetsInfo global")
 
@@ -252,6 +258,12 @@ def chain(dump: "Dump", path: str, *, pointer_size: int = 8) -> Chain:
     Roots: a class/struct name (object-relative chain), ``Owner::Member``, or an
     OffsetsInfo global (``GWorld``, ``OFFSET_GWORLD``, ...; module-relative chain).
     Index steps are supported for fixed C arrays and ``TArray``.
+
+    A cast, ``Controller(APlayerController).PlayerCameraManager`` or
+    ``Attributes[0](UAttributeSet_Oxygen).Oxygen``, re-types an object pointer as one of
+    its subclasses so the walk can continue into members the declared type lacks. The
+    cast class must be defined in the dump and be the declared class or derive from it;
+    the dump cannot know what the object really is at run time, so the caller must.
     """
     tokens = parse_path(path)
     base, root_name, root_hop, cursor, cur_type, rest = _resolve_root(dump, tokens)
@@ -260,7 +272,7 @@ def chain(dump: "Dump", path: str, *, pointer_size: int = 8) -> Chain:
     pieces: list[str] = [root_name]
     at = root_name
 
-    for name, index in rest:
+    for name, index, cast in rest:
         struct = _require_cursor(dump, cursor, cur_type, at)
         found = struct.find_member(name)
         if found is None:
@@ -287,6 +299,20 @@ def chain(dump: "Dump", path: str, *, pointer_size: int = 8) -> Chain:
             cur_type = elem
         else:
             raise ChainError(f"{struct.name}.{name} is {member.type}, not an indexable array")
+
+        if cast is not None:
+            declared = _struct_for(dump, cur_type)
+            if not cur_type.is_pointer or declared is None:
+                raise ChainError(f"{at} is {cur_type}, not a pointer to a class or struct the dump defines: nothing to cast")
+            target = dump.find_struct(cast)
+            if target is None:
+                raise ChainError(f"cannot cast {at} to {cast!r}: not defined in the dump")
+            if target is not declared and not target.is_subclass_of(declared.name):
+                raise ChainError(f"cannot cast {at} to {target.name}: it does not derive from {declared.name}")
+            cur_type = replace(cur_type, name=target.name, kind=target.kind)
+            label = f"{label}({target.name})"
+            at = f"{at}({target.name})"
+            hops[-1] = replace(hops[-1], type=cur_type, cast=target, note=f"deref as {target.name} (declared {declared.name}*)")
 
         pieces.append(label)
         cursor = _struct_for(dump, cur_type)
@@ -331,7 +357,7 @@ def find_paths(
     Follows plain pointers, embedded structs, fixed arrays and ``TArray`` elements
     (as ``[0]``); ``TMap``/``TSet``/smart pointers are opaque. Shortest routes first.
     """
-    base, root_name, root_hop, start, cur_type, rest = _resolve_root(dump, [(src, None)])
+    base, root_name, root_hop, start, cur_type, rest = _resolve_root(dump, [(src, None, None)])
     if rest:
         raise ChainError(f"find_paths src must be a type or global, got {src!r}")
     if start is None:

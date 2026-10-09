@@ -14,9 +14,11 @@ GWORLD = 1011  # fixture OFFSET_GWORLD
 
 
 def test_parse_path():
-    assert parse_path("UWorld.Levels[3].Actors") == [("UWorld", None), ("Levels", 3), ("Actors", None)]
-    assert parse_path("Engine::FHitResult.Location") == [("Engine::FHitResult", None), ("Location", None)]
-    for bad in ("", "UWorld.", "UWorld.Levels[x]", "UWorld.Levels[]", "1abc", "A..B"):
+    assert parse_path("UWorld.Levels[3].Actors") == [("UWorld", None, None), ("Levels", 3, None), ("Actors", None, None)]
+    assert parse_path("Engine::FHitResult.Location") == [("Engine::FHitResult", None, None), ("Location", None, None)]
+    assert parse_path("ULevel.Actors[0](APawn).Controller(Engine::AC)") == [
+        ("ULevel", None, None), ("Actors", 0, "APawn"), ("Controller", None, "Engine::AC")]
+    for bad in ("", "UWorld.", "UWorld.Levels[x]", "UWorld.Levels[]", "1abc", "A..B", "A.B()", "A.B(1)", "A.B(C)[0]", "A.B(C)(D)"):
         with pytest.raises(ChainError):
             parse_path(bad)
 
@@ -91,6 +93,43 @@ def test_inherited_member_and_owner_forms(dump: Dump):
     ],
 )
 def test_chain_errors(dump: Dump, path, match):
+    with pytest.raises(ChainError, match=match):
+        chain(dump, path)
+
+
+def test_cast_retypes_a_pointer_to_a_subclass(dump: Dump):
+    """``Actors[0](APawn)``: the element is declared AActor*, the caller knows it is a pawn."""
+    c = chain(dump, "ULevel.Actors[0](APawn).Controller")
+    assert c.path == "ULevel.Actors[0](APawn).Controller"
+    assert [h.label for h in c.hops] == ["Actors", "[0]", "Controller"]
+    element = c.hops[1]
+    assert element.cast is dump.classes.APawn and element.type == TypeRef("APawn", "C", "*") and element.deref
+    assert element.member is None and element.index == 0 and "deref as APawn (declared AActor*)" in element.describe()
+    assert c.hops[0].cast is None and c.hops[2].cast is None
+    plain = chain(dump, "ULevel.Actors[0]")
+    assert c.offsets == [*plain.offsets, dump.classes.APawn.members.Controller.offset]
+    # a chain may end on the cast pointer itself; a cast to the declared class is a no-op
+    end = chain(dump, "ULevel.Actors[0](APawn)")
+    assert end.result_is_pointer and end.result_type.name == "APawn" and end.offsets == plain.offsets
+    same = chain(dump, "UWorld.PersistentLevel(ULevel).Actors")
+    assert same.offsets == chain(dump, "UWorld.PersistentLevel.Actors").offsets and same.hops[0].cast is dump.classes.ULevel
+    # a member pointer, cast
+    assert chain(dump, "ULevel.OwningWorld(UWorld).PersistentLevel").result_type.name == "ULevel"
+
+
+@pytest.mark.parametrize(
+    "path, match",
+    [
+        ("ULevel.Actors[0](UWorld).Levels", "does not derive from AActor"),
+        ("ULevel.Actors[0](ANope).Controller", "not defined in the dump"),
+        ("AActor.Tags[0](APawn)", "nothing to cast"),
+        ("UWorld.OwningGameInstance(UWorld)", "nothing to cast"),      # declared type not in the dump
+        ("ULevel.Actors(APawn)", "nothing to cast"),                   # the array, not an element
+        ("APawn(AActor).Tags", "root APawn cannot be cast"),
+        ("GWorld(UWorld).Levels", "root GWorld cannot be cast"),
+    ],
+)
+def test_cast_errors(dump: Dump, path, match):
     with pytest.raises(ChainError, match=match):
         chain(dump, path)
 
