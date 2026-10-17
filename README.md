@@ -83,7 +83,9 @@ where `<Engine>` and `<Location>` come from that repo's `Games/GameList.json` (e
 - Current Dumper-7 never sets the `&` reference marker on parameters, so `Param.is_reference` is
   `False` for its output. Out-parameters are not distinguishable from the dump alone.
 - `TArray`, `TMap`, `TSubclassOf` and other templates have no definition in the dump, so
-  `dump.type_of()` returns `None` for them; inspect `TypeRef.sub_types` instead.
+  `dump.type_of()` returns `None` for them; inspect `TypeRef.sub_types` instead. The one exception
+  is `TPair<K, V>` (what a `TMap` slot holds): `type_of` returns the synthetic struct from
+  `dump.pair_struct(K, V)` with `Key` and `Value` members.
 
 ### Pointer chains
 
@@ -119,7 +121,19 @@ Embedded structs are folded into a single offset.
 - Roots: a class/struct, `Owner::Member`, or an `OffsetsInfo.json` global (`GWorld`, `GObjects`,
   `GNames`, or any raw `OFFSET_*` key). Only `GWorld` is a pointer the chain can descend through.
 - Index steps: fixed C arrays and `TArray` (data pointer at +0, stride from the dump or a small
-  primitive table; `pointer_size=` defaults to 8). `TMap`, `TSet` and smart pointers raise `ChainError`.
+  primitive table; `pointer_size=` defaults to 8), and the sparse containers `TSet`/`TMap`:
+  `Set[2]` is the element, `Map[3]` a `TPair<K, V>` whose `.Key`/`.Value` continue the walk
+  (`Map[3].Value(APawn).Controller`). The index is the slot in the engine's sparse array, holes
+  included: the dump cannot say which slots are live, so a walker must test bit `i` of the
+  container's allocation flags (inline words at +0x10, or at the pointer at +0x20 when `MaxBits`
+  at +0x2C exceeds 128) and knows the live count as `Num - NumFreeIndices` (+0x08, +0x34). Each
+  slot is `TSetElement<T> { T; int32 HashNextId; int32 HashIndex }`, so the stride
+  (`chains.set_element_layout`) needs the element's alignment, which no Dumpspace records:
+  `chains.alignment` takes pointers, primitives and enums as exact, dump-defined structs from
+  their members (raised to 16 for the SIMD types `FQuat`/`FVector4`/`FPlane`/`FMatrix`/`FTransform`),
+  and undefined types such as `FName`, `FText` or `TWeakObjectPtr` from the largest power of two
+  dividing every offset the dump's own members of that type sit at (`dump.observed_alignment`).
+  Smart pointers still raise `ChainError`.
 - Casts: `Actors[0](APawn).Controller` or `Controller(APlayerController).PlayerCameraManager` re-type
   an object pointer as a subclass defined in the dump (the declared class itself, or one deriving
   from it), so the walk can continue into members the declared type lacks. The hop keeps its offset

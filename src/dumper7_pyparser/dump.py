@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from math import gcd
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,8 @@ class Dump:
     ``dump.offsets.OFFSET_GWORLD``          -> ``int``
     """
 
-    __slots__ = ("classes", "structs", "enums", "functions", "offsets", "info", "source", "_observed_sizes")
+    __slots__ = ("classes", "structs", "enums", "functions", "offsets", "info", "source",
+                 "_observed_sizes", "_observed_alignments", "_pairs")
 
     def __init__(
         self,
@@ -49,6 +51,8 @@ class Dump:
 
     def _link(self) -> None:
         self._observed_sizes: dict[str, int | None] | None = None
+        self._observed_alignments: dict[str, int] | None = None
+        self._pairs: dict[tuple[TypeRef, TypeRef, int], Struct] = {}
         for ns in (self.classes, self.structs):
             for struct in ns.values():
                 struct._dump = self
@@ -119,7 +123,14 @@ class Dump:
         return found
 
     def type_of(self, ref: TypeRef) -> Struct | EnumDef | None:
-        """The definition a :class:`TypeRef` points at, or ``None`` for primitives/unknowns."""
+        """The definition a :class:`TypeRef` points at, or ``None`` for primitives/unknowns.
+
+        Templates have no definition in the dump, with one exception: ``TPair<K, V>``
+        (what a ``TMap`` slot holds) resolves to the synthetic struct of
+        :meth:`pair_struct`, so a chain can continue into ``.Key`` / ``.Value``.
+        """
+        if ref.name == "TPair" and len(ref.sub_types) >= 2 and not ref.is_pointer:
+            return self.pair_struct(ref.sub_types[0], ref.sub_types[1])
         if ref.kind is TypeKind.CLASS:
             return self.classes.get(ref.name) or self.structs.get(ref.name)
         if ref.kind is TypeKind.STRUCT:
@@ -127,6 +138,29 @@ class Dump:
         if ref.kind is TypeKind.ENUM:
             return self.enums.get(ref.name)
         return None
+
+    def pair_struct(self, key: TypeRef, value: TypeRef, pointer_size: int = 8) -> Struct:
+        """The ``TPair<key, value>`` a ``TMap`` slot holds, as a synthetic :class:`Struct`.
+
+        ``Key`` sits at offset 0, ``Value`` at the first offset aligned for it; the sizes
+        and alignments come from :func:`dumper7_pyparser.chains.pair_layout`. Cached per
+        pair of types, so the same object comes back every time (the ``members`` cache
+        and identity checks work as for dump-defined structs). Raises ``ChainError``
+        when a side cannot be sized.
+        """
+        cached = self._pairs.get((key, value, pointer_size))
+        if cached is None:
+            from .chains import pair_layout
+
+            layout = pair_layout(self, key, value, pointer_size)
+            name = f"TPair<{key}, {value}>"
+            members = Namespace({
+                "Key": Member("Key", name, key, 0, layout.key_size),
+                "Value": Member("Value", name, value, layout.value_offset, layout.value_size),
+            }, label=name)
+            cached = Struct(name, TypeKind.STRUCT, layout.size, (), members, _dump=self)
+            self._pairs[(key, value, pointer_size)] = cached
+        return cached
 
     def observed_size(self, name: str) -> int | None:
         """Byte size the dump's members give the type ``name``, or ``None``.
@@ -149,6 +183,32 @@ class Dump:
                             sizes[ref.name] = None
             self._observed_sizes = sizes
         return sizes.get(name)
+
+    def observed_alignment(self, name: str) -> int | None:
+        """Alignment the dump's members suggest for the type ``name``, or ``None``.
+
+        The dump records offsets but no alignments. Every member of a type sits at a
+        multiple of that type's alignment, so the largest power of two dividing all the
+        offsets of the plain members of ``name`` (no pointers or bitfields; fixed arrays
+        count, their first element is aligned too) is the alignment, provided the type
+        occurs often enough that one of them is not over-aligned by chance. Capped at 8,
+        ``None`` when no such member exists or every one sits at offset 0.
+        """
+        aligns = self._observed_alignments
+        if aligns is None:
+            aligns = {}
+            for ns in (self.classes, self.structs):
+                for struct in ns.values():
+                    for member in struct.own_members.values():
+                        ref = member.type
+                        if ref.is_pointer or member.bit_offset is not None:
+                            continue
+                        aligns[ref.name] = gcd(aligns.get(ref.name, 0), member.offset)
+            self._observed_alignments = aligns
+        g = aligns.get(name, 0)
+        if g == 0:
+            return None
+        return min(g & -g, 8)
 
     def resolve(self, query: str) -> Member | Function:
         """Resolve ``"Owner::Name"`` to a member (via inheritance) or function."""

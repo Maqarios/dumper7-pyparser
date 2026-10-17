@@ -22,6 +22,10 @@ Offsets contract for ``Chain.offsets``::
 
 If ``result_is_pointer`` the final member is itself a pointer: read it once more
 to reach the object it points at.
+
+Index steps cover fixed C arrays, ``TArray`` and the sparse containers ``TSet``/``TMap``
+(``Map[3].Value``; see :func:`chain`); their strides need type alignments, which the
+dump does not record and :func:`alignment` reconstructs.
 """
 
 from __future__ import annotations
@@ -37,7 +41,8 @@ from .types import TypeKind, TypeRef
 if TYPE_CHECKING:
     from .dump import Dump
 
-__all__ = ["Chain", "ChainError", "Hop", "chain", "find_paths", "element_size", "parse_path"]
+__all__ = ["Chain", "ChainError", "Hop", "PairLayout", "SIMD_ALIGNED", "SPARSE_CONTAINERS", "alignment", "chain",
+           "element_size", "find_paths", "pair_layout", "pair_struct", "parse_path", "set_element_layout"]
 
 
 class ChainError(LookupError):
@@ -194,6 +199,130 @@ def element_size(dump: "Dump", ref: TypeRef, pointer_size: int = 8) -> int:
     raise ChainError(f"unknown element size for {ref}")
 
 
+# -- sparse containers (TSet / TMap) --------------------------------------------------
+
+# Containers whose elements live in a TSparseArray: ``TSet<T>`` and ``TMap<K, V>`` (a
+# TSet of ``TPair<K, V>``). Both are 80 bytes with the element data pointer at +0, like a
+# TArray, so an index step is the same two hops. Which slots are live is not in the dump:
+# the allocation bit array at +0x10 (inline words; at the pointer at +0x20 when MaxBits >
+# 128) says, and ``Num - NumFreeIndices`` (+0x08, +0x34) counts them.
+SPARSE_CONTAINERS: tuple[str, ...] = ("TMap", "TSet")
+
+# Engine types declared ``alignas(16)`` (SIMD): the dump's members cannot reveal that, so
+# their structs, and every struct holding one, are raised to 16 here.
+SIMD_ALIGNED: dict[str, int] = {
+    name: 16
+    for base in ("FQuat", "FVector4", "FPlane")
+    for name in (base, base + "4f", base + "4d")
+} | {
+    "FMatrix": 16, "FMatrix44f": 16, "FMatrix44d": 16,
+    "FTransform": 16, "FTransform3f": 16, "FTransform3d": 16,
+}
+
+
+def _round_up(n: int, align: int) -> int:
+    return (n + align - 1) // align * align
+
+
+def _pow2_dividing(n: int) -> int:
+    """The largest power of two that divides ``n`` (1 for 0)."""
+    return n & -n if n > 0 else 1
+
+
+def alignment(dump: "Dump", ref: TypeRef, pointer_size: int = 8, _seen: frozenset[str] = frozenset()) -> int:
+    """Alignment of one ``ref`` value, as the engine's compiler lays it out.
+
+    Pointers, primitives and enums are exact. A struct the dump defines takes the largest
+    alignment of its members (recursively), raised to 16 for the SIMD types in
+    ``SIMD_ALIGNED`` and the structs that hold them. Any other type (``FName``, ``FText``,
+    ``TSubclassOf<...>``, ``TWeakObjectPtr<...>``, ...) takes what the offsets of the
+    dump's own members of that type reveal, see :meth:`Dump.observed_alignment`, or the
+    largest power of two dividing its observed size. Raises ``ChainError`` for a type the
+    dump never mentions.
+    """
+    if ref.is_pointer:
+        return pointer_size
+    if ref.name == "TPair" and len(ref.sub_types) >= 2:
+        return pair_layout(dump, ref.sub_types[0], ref.sub_types[1], pointer_size).align
+    if ref.name in SIMD_ALIGNED and not ref.sub_types:
+        return SIMD_ALIGNED[ref.name]
+    if ref.name in PRIMITIVE_SIZES and not ref.sub_types:
+        return 8 if ref.name == "FString" else PRIMITIVE_SIZES[ref.name]   # FString: pointer + two int32
+    if ref.kind is TypeKind.ENUM:
+        enum = dump.enums.get(ref.name)
+        if enum is not None and enum.underlying_type in PRIMITIVE_SIZES:
+            return PRIMITIVE_SIZES[enum.underlying_type]
+        return 1
+    if ref.kind in (TypeKind.CLASS, TypeKind.STRUCT) and not ref.sub_types:
+        defined = dump.type_of(ref)
+        if isinstance(defined, Struct):
+            if defined.name in _seen:
+                return 1
+            seen = _seen | {defined.name}
+            align = 1
+            for member in defined.members.values():
+                if member.bit_offset is not None:
+                    continue
+                try:
+                    align = max(align, alignment(dump, member.type, pointer_size, seen))
+                except ChainError:
+                    continue                      # an unsized member cannot raise the alignment
+            if align == 1 and not defined.members:
+                align = min(_pow2_dividing(defined.size), 8)
+            return align
+    observed = dump.observed_alignment(ref.name)
+    if observed:
+        return observed
+    size = dump.observed_size(ref.name)
+    if size:
+        return min(_pow2_dividing(size), 8)
+    raise ChainError(f"unknown alignment for {ref}")
+
+
+@dataclass(frozen=True, slots=True)
+class PairLayout:
+    """Where ``Key`` and ``Value`` sit inside a ``TPair<K, V>`` (a TMap slot's payload)."""
+
+    key_size: int
+    key_align: int
+    value_offset: int
+    value_size: int
+    value_align: int
+    size: int
+    align: int
+
+
+def pair_layout(dump: "Dump", key: TypeRef, value: TypeRef, pointer_size: int = 8) -> PairLayout:
+    """Layout of ``TPair<key, value>``: ``Key`` at 0, ``Value`` at the next offset aligned
+    for it, the whole padded to the stricter alignment (the compiler's rule for a struct of
+    two fields)."""
+    key_size, key_align = element_size(dump, key, pointer_size), alignment(dump, key, pointer_size)
+    value_size, value_align = element_size(dump, value, pointer_size), alignment(dump, value, pointer_size)
+    value_offset = _round_up(key_size, value_align)
+    align = max(key_align, value_align)
+    return PairLayout(key_size, key_align, value_offset, value_size, value_align, _round_up(value_offset + value_size, align), align)
+
+
+def pair_struct(dump: "Dump", key: TypeRef, value: TypeRef, pointer_size: int = 8) -> Struct:
+    """The synthetic ``TPair<key, value>`` struct a TMap slot holds; see :meth:`Dump.pair_struct`."""
+    return dump.pair_struct(key, value, pointer_size)
+
+
+def set_element_layout(dump: "Dump", elem: TypeRef, pointer_size: int = 8) -> tuple[int, int, int]:
+    """``(size, align, stride)`` of a ``TSet``/``TMap`` slot holding ``elem``.
+
+    A slot is ``TSetElement<T> { T Value; int32 HashNextId; int32 HashIndex; }``: the
+    two hash fields follow the value at the next multiple of 4 and the whole is padded to
+    the value's alignment (the sparse array's free-list link, two int32, never exceeds
+    it). ``size`` is the value's own size, the stride the distance between slots. For a
+    ``TMap`` pass ``TypeRef("TPair", TypeKind.STRUCT, "", (K, V))``.
+    """
+    size = element_size(dump, elem, pointer_size)
+    align = alignment(dump, elem, pointer_size)
+    stride = _round_up(_round_up(size, 4) + 8, max(align, 4))
+    return size, align, stride
+
+
 # -- walking ----------------------------------------------------------------------------
 
 
@@ -245,8 +374,10 @@ def _require_cursor(dump: "Dump", cursor: Struct | None, cur_type: TypeRef | Non
     if cursor is not None:
         return cursor
     assert cur_type is not None
-    if cur_type.name == "TArray":
+    if cur_type.name in ("TArray", "TSet"):
         raise ChainError(f"{at} is {cur_type}; add an index like {at}[0] to reach an element")
+    if cur_type.name == "TMap":
+        raise ChainError(f"{at} is {cur_type}; add a slot index like {at}[0] to reach its Key/Value pair")
     if cur_type.kind in (TypeKind.CLASS, TypeKind.STRUCT):
         raise ChainError(f"cannot descend into {at}: {cur_type.name} is not defined in the dump")
     raise ChainError(f"cannot descend into {at}: {cur_type} is not a class or struct")
@@ -257,7 +388,11 @@ def chain(dump: "Dump", path: str, *, pointer_size: int = 8) -> Chain:
 
     Roots: a class/struct name (object-relative chain), ``Owner::Member``, or an
     OffsetsInfo global (``GWorld``, ``OFFSET_GWORLD``, ...; module-relative chain).
-    Index steps are supported for fixed C arrays and ``TArray``.
+    Index steps are supported for fixed C arrays, ``TArray``, ``TSet`` and ``TMap``. A
+    ``TSet``/``TMap`` index is the slot in the engine's sparse array (holes included):
+    ``Map[3]`` is a ``TPair<K, V>`` with ``.Key`` and ``.Value`` members, ``Set[3]`` the
+    element itself; the stride comes from :func:`set_element_layout`. The dump cannot say
+    whether a slot is live, the walker must test the container's allocation bits.
 
     A cast, ``Controller(APlayerController).PlayerCameraManager`` or
     ``Attributes[0](UAttributeSet_Oxygen).Oxygen``, re-types an object pointer as one of
@@ -295,6 +430,17 @@ def chain(dump: "Dump", path: str, *, pointer_size: int = 8) -> Chain:
             elem = member.type.sub_types[0]
             stride = element_size(dump, elem, pointer_size)
             hops.append(Hop(name, member.offset, member.type, True, member, note="read Data pointer"))
+            hops.append(Hop(f"[{index}]", index * stride, elem, elem.is_pointer, None, index, stride))
+            cur_type = elem
+        elif member.type.name in SPARSE_CONTAINERS and member.type.sub_types and not member.type.is_pointer:
+            if member.type.name == "TMap":
+                if len(member.type.sub_types) < 2:
+                    raise ChainError(f"{struct.name}.{name} is {member.type}: no key/value types")
+                elem = TypeRef("TPair", TypeKind.STRUCT, "", member.type.sub_types[:2])
+            else:
+                elem = member.type.sub_types[0]
+            _, _, stride = set_element_layout(dump, elem, pointer_size)
+            hops.append(Hop(name, member.offset, member.type, True, member, note="read Elements.Data pointer"))
             hops.append(Hop(f"[{index}]", index * stride, elem, elem.is_pointer, None, index, stride))
             cur_type = elem
         else:

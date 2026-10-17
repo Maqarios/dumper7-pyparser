@@ -4,7 +4,10 @@ import pytest
 
 from dumper7_pyparser import Dump, load_dump
 from dumper7_pyparser.__main__ import main
-from dumper7_pyparser.chains import Chain, ChainError, chain, element_size, find_paths, parse_path
+from dumper7_pyparser.chains import (
+    Chain, ChainError, alignment, chain, element_size, find_paths, pair_layout, pair_struct, parse_path,
+    set_element_layout,
+)
 from dumper7_pyparser.types import TypeKind, TypeRef
 
 GWORLD = 1011  # fixture OFFSET_GWORLD
@@ -84,7 +87,9 @@ def test_inherited_member_and_owner_forms(dump: Dump):
         ("APawn.Nope", "searched APawn, AActor, UObject"),
         ("UWorld.Levels.Actors", "add an index"),
         ("UWorld.PersistentLevel[0]", "not an indexable array"),
-        ("UWorld.ActorMap[0]", "not an indexable array"),
+        ("UWorld.ActorMap.Key", "add a slot index"),
+        ("UWorld.ActorMap[0].Nope", "has no member 'Nope'"),
+        ("UWorld.ActorMap[0](APawn)", "nothing to cast"),
         ("FVector.X.Y", "not a class or struct"),
         ("APawn.RootComponent.Nope", "not defined in the dump"),
         ("UWorld[0].Levels", "cannot be indexed"),
@@ -170,6 +175,137 @@ def test_observed_size_refuses_types_whose_members_disagree():
     assert mixed.observed_size("FOdd") is None
     with pytest.raises(ChainError, match="unknown element size"):
         element_size(mixed, TypeRef("FOdd"))
+
+
+# -- sparse containers -------------------------------------------------------------------
+
+
+def _model_dump(**structs):
+    """A dump built from model objects: ``name=[(member, type, offset, size[, dim]), ...]``."""
+    from dumper7_pyparser.models import Member, Struct
+    from dumper7_pyparser._namespace import Namespace
+
+    built = {}
+    for name, members in structs.items():
+        size = max((m[2] + m[3] for m in members), default=0)
+        ns = Namespace({m[0]: Member(m[0], name, m[1], m[2], m[3], *m[4:]) for m in members}, label=name)
+        built[name] = Struct(name, TypeKind.STRUCT, size, (), ns)
+    return Dump(structs=Namespace(built, label="structs"))
+
+
+def test_alignment(dump: Dump):
+    assert alignment(dump, TypeRef("int32")) == 4 and alignment(dump, TypeRef("bool")) == 1
+    assert alignment(dump, TypeRef("FString")) == 8                    # pointer + num + max
+    assert alignment(dump, TypeRef("AActor", "C", "*")) == 8
+    assert alignment(dump, TypeRef("AActor", "C", "*"), pointer_size=4) == 4
+    assert alignment(dump, TypeRef("EWorldType", "E")) == 1 and alignment(dump, TypeRef("EBig", "E")) == 4
+    assert alignment(dump, TypeRef("FVector", "S")) == 4               # three floats
+    assert alignment(dump, TypeRef("Engine::FHitResult", "S")) == 8    # holds a TWeakObjectPtr seen at 104
+    assert alignment(dump, TypeRef("FTickFunction", "S")) == 4
+    assert alignment(dump, TypeRef("FName", "S")) == 8                 # UObject.Name sits at 24
+    with pytest.raises(ChainError, match="unknown alignment"):
+        alignment(dump, TypeRef("FNoSuchType", "S"))
+
+
+def test_observed_alignment_is_the_gcd_of_offsets():
+    odd = TypeRef("FOdd")
+    d = _model_dump(FA=[("A", odd, 8, 8)], FB=[("B", odd, 12, 8)])
+    assert d.observed_alignment("FOdd") == 4 and alignment(d, odd) == 4
+    d = _model_dump(FA=[("A", odd, 16, 8)], FB=[("B", odd, 32, 8)])
+    assert d.observed_alignment("FOdd") == 8                           # capped at 8
+    d = _model_dump(FA=[("A", odd, 0, 8)])
+    assert d.observed_alignment("FOdd") is None and alignment(d, odd) == 8   # falls back to the size
+    d = _model_dump(FA=[("A", odd, 0, 12)])
+    assert alignment(d, odd) == 4                                      # largest power of two dividing 12
+    d = _model_dump(FA=[("A", odd, 4, 16, 2)], FB=[("B", odd, 16, 8)])
+    assert d.observed_alignment("FOdd") == 4                           # a fixed array counts
+    d = _model_dump(FA=[("A", TypeRef("FOdd", "S", "*"), 4, 8)])
+    assert d.observed_alignment("FOdd") is None                        # pointers do not
+    assert d.observed_alignment("FNoSuchType") is None
+
+
+def test_simd_types_and_their_containers_are_16_aligned():
+    f = TypeRef("float")
+    quat = [("X", f, 0, 4), ("Y", f, 4, 4), ("Z", f, 8, 4), ("W", f, 12, 4)]
+    d = _model_dump(FQuat=quat, FHolder=[("Q", TypeRef("FQuat", "S"), 0, 16), ("F", f, 16, 4)], FPlain=quat)
+    assert alignment(d, TypeRef("FQuat", "S")) == 16
+    assert alignment(d, TypeRef("FHolder", "S")) == 16
+    assert alignment(d, TypeRef("FPlain", "S")) == 4
+    assert alignment(d, TypeRef("FTransform3d", "S")) == 16            # table entry, even undefined
+
+
+def test_set_element_layout(dump: Dump):
+    assert set_element_layout(dump, TypeRef("int32")) == (4, 4, 12)
+    assert set_element_layout(dump, TypeRef("uint8")) == (1, 1, 12)
+    assert set_element_layout(dump, TypeRef("AActor", "C", "*")) == (8, 8, 16)
+    assert set_element_layout(dump, TypeRef("AActor", "C", "*"), pointer_size=4) == (4, 4, 12)
+    assert set_element_layout(dump, TypeRef("FVector", "S")) == (12, 4, 20)
+    assert set_element_layout(dump, TypeRef("FName", "S")) == (8, 8, 16)
+    assert set_element_layout(dump, TypeRef("Engine::FHitResult", "S")) == (136, 8, 144)
+    with pytest.raises(ChainError):
+        set_element_layout(dump, TypeRef("FNoSuchType", "S"))
+
+
+def test_pair_struct(dump: Dump):
+    key, value = TypeRef("FName", "S"), TypeRef("AActor", "C", "*")
+    pair = pair_struct(dump, key, value)
+    assert pair.name == "TPair<FName, AActor*>" and pair.kind is TypeKind.STRUCT and pair.size == 16
+    assert [(m.name, m.offset, m.size, m.owner) for m in pair.members.values()] == [
+        ("Key", 0, 8, pair.name), ("Value", 8, 8, pair.name)]
+    assert pair_struct(dump, key, value) is pair                                        # cached
+    assert dump.type_of(TypeRef("TPair", "S", "", (key, value))) is pair                # how chains find it
+    assert element_size(dump, TypeRef("TPair", "S", "", (key, value))) == 16
+    assert pair_layout(dump, key, value).align == 8
+    # a 4-aligned FName (the engine's) next to an int32 packs tighter: 12 bytes, 20 per slot
+    d = _model_dump(FA=[("Name", key, 4, 8)])
+    pair = pair_struct(d, key, TypeRef("int32"))
+    assert (pair.size, pair.members.Value.offset) == (12, 8)
+    assert set_element_layout(d, TypeRef("TPair", "S", "", (key, TypeRef("int32")))) == (12, 4, 20)
+    # and a pointer value after a 4-aligned key is pushed to 8
+    pair = pair_struct(d, key, value)
+    assert (pair.size, pair.members.Value.offset) == (16, 8)
+
+
+def test_tmap_slot_index(dump: Dump):
+    c = chain(dump, "UWorld.ActorMap[3]")
+    assert [h.label for h in c.hops] == ["ActorMap", "[3]"]
+    assert c.hops[0].deref and c.hops[0].note == "read Elements.Data pointer" and c.hops[0].member is dump.classes.UWorld.ActorMap
+    slot = c.hops[1]
+    assert slot.index == 3 and slot.stride == 24 and slot.offset == 72 and slot.member is None and not slot.deref
+    assert str(slot.type) == "TPair<FName, AActor*>" and c.offsets == [0x1A0, 72]
+    assert "index 3 x 24" in c.render()
+    key = chain(dump, "UWorld.ActorMap[3].Key")
+    assert key.offsets == [0x1A0, 72] and str(key.result_type) == "FName" and not key.result_is_pointer
+    value = chain(dump, "UWorld.ActorMap[3].Value")
+    assert value.offsets == [0x1A0, 80] and str(value.result_type) == "AActor*" and value.result_is_pointer
+    cast = chain(dump, "UWorld.ActorMap[3].Value(APawn).Controller")
+    assert cast.offsets == [0x1A0, 80, dump.classes.APawn.members.Controller.offset]
+    assert cast.hops[2].cast is dump.classes.APawn and cast.path == "UWorld.ActorMap[3].Value(APawn).Controller"
+    with pytest.raises(ChainError, match="has no member 'Nope'"):
+        chain(dump, "UWorld.ActorMap[3].Value.Nope")
+    with pytest.raises(ChainError, match="searched TPair<FName, AActor\\*>"):
+        chain(dump, "UWorld.ActorMap[3].Nope")
+
+
+def test_tset_element_index():
+    actor = TypeRef("AActor", "C", "*")
+    d = _model_dump(
+        FHolder=[("Ids", TypeRef("TSet", "C", "", (TypeRef("int32"),)), 0x10, 80),
+                 ("Points", TypeRef("TSet", "C", "", (TypeRef("FVector", "S"),)), 0x60, 80),
+                 ("Actors", TypeRef("TSet", "C", "", (actor,)), 0xB0, 80)],
+        FVector=[("X", TypeRef("float"), 0, 4), ("Y", TypeRef("float"), 4, 4), ("Z", TypeRef("float"), 8, 4)],
+        AActor=[("Dummy", TypeRef("int32"), 0, 4)],
+    )
+    c = chain(d, "FHolder.Ids[2]")
+    assert c.offsets == [0x10, 24] and str(c.result_type) == "int32" and c.hops[1].stride == 12
+    assert chain(d, "FHolder.Points[2].Z").offsets == [0x60, 48]       # stride 20, Z at +8
+    c = chain(d, "FHolder.Actors[1]")
+    assert c.offsets == [0xB0, 16] and c.result_is_pointer
+    assert chain(d, "FHolder.Actors[1].Dummy").offsets == [0xB0, 16, 0]
+    with pytest.raises(ChainError, match="add an index"):
+        chain(d, "FHolder.Ids.X")
+    with pytest.raises(ChainError, match="not a class or struct"):
+        chain(d, "FHolder.Ids[0].X")
 
 
 # -- global roots ----------------------------------------------------------------------
